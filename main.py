@@ -2,6 +2,7 @@
 import numpy as np
 import random
 from data.data_ingestion import load_and_preprocess
+from models.baseline_model import SVR_Model
 from models.lstm_model import LSTM_Model
 from graph.road_graph import RoadGraph 
 
@@ -63,6 +64,26 @@ if __name__ == "__main__":
 
     print(f"Prediction Index (0-1) Generated: {normalized_prediction_value:.4f}")
 
+    # --- PHASE 4: Model Comparison (BCS302 Metrics) ---
+    print("\n--- PHASE 4: Model Comparison (BCS302 Metrics) ---")
+
+    # 1. Run LSTM Evaluation
+    # Note: X_test_3d is already ready for LSTM
+    y_pred_lstm = lstm_model.predict(X_test_3d) 
+    rmse_lstm, mae_lstm = lstm_model.evaluate(y_test, y_pred_lstm)
+    print(f"LSTM Results:\nRMSE: {rmse_lstm:.4f}\nMAE: {mae_lstm:.4f}")
+
+    # 2. Run Baseline (SVR) Evaluation
+    svr_model = SVR_Model()
+    # Train SVR using the same data, but it requires input flattened to 2D
+    svr_model.train(X_train_3d, y_train) 
+    y_pred_svr = svr_model.predict(X_test_3d)
+    rmse_svr, mae_svr = svr_model.evaluate(y_test, y_pred_svr)
+    print(f"SVR Baseline Results:\nRMSE: {rmse_svr:.4f}\nMAE: {mae_svr:.4f}")
+    
+    # Update the phase label for the final integration block:
+    # --- E: Final Integration Logic (Now Phase 5) ---
+    print("\n--- PHASE 5: Dynamic Graph Optimization ---")
     # --- C: Integration Logic (Maths/DS) ---
     print("\n--- PHASE 3: Dynamic Graph Optimization ---")
 

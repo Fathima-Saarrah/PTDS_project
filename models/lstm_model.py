@@ -1,9 +1,13 @@
 # models/lstm_model.py - The Core Prediction Engine
+# models/lstm_model.py
+
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.metrics import mean_squared_error, mean_absolute_error 
 import numpy as np
+from.base_model import BaseModel # Using the correct relative import
 
-class LSTM_Model: # This class structure satisfies the OOP (BCS306) requirement
+class LSTM_Model(BaseModel): # This class structure satisfies the OOP (BCS306) requirement
     """
     Core Prediction Layer using LSTM for traffic time-series forecasting.
     LSTM excels at handling the non-linear time dynamics of traffic flow,  
@@ -41,3 +45,13 @@ class LSTM_Model: # This class structure satisfies the OOP (BCS306) requirement
         # CORRECTED Reshape Syntax:
         X_test_3d = X_test.reshape(X_test.shape[0], X_test.shape[1], self.n_features)
         return self.model.predict(X_test_3d, verbose=0)
+
+    # Add this method to satisfy the BaseModel abstract class:
+    def evaluate(self, y_true: np.ndarray, y_pred: np.ndarray):
+        """
+        Calculates mandatory evaluation metrics (RMSE, MAE) for the LSTM.
+        This satisfies the abstract method requirement.
+        """
+        rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+        mae = mean_absolute_error(y_true, y_pred)
+        return rmse, mae
