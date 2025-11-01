@@ -1,6 +1,8 @@
 # main.py - Orchestrates the entire PTDS system
 import numpy as np
 import random
+from phase1_route import run_phase1
+from phase2_visualize import visualize_phase1
 from data.data_ingestion import load_and_preprocess
 from models.baseline_model import SVR_Model
 from models.lstm_model import LSTM_Model
@@ -64,6 +66,22 @@ if __name__ == "__main__":
 
     print(f"Prediction Index (0-1) Generated: {normalized_prediction_value:.4f}")
 
+    # Run Phase 1 route check using the same prediction index
+    try:
+        print("\n--- PHASE 1 ROUTE CHECK (Local Map) ---")
+        run_phase1(prediction_index=float(normalized_prediction_value))
+    except Exception as e:
+        print(f"Warning: Phase 1 route check failed: {e}")
+
+    # Visualize Phase 1 results (will show NetworkX/Matplotlib plot)
+    try:
+        print("\n--- PHASE 2 (VISUALIZATION): Drawing traffic map ---")
+        visualize_phase1(prediction_index=float(normalized_prediction_value), show_plot=True)
+    except ImportError:
+        print("Visualization dependencies missing. Install with: pip install networkx matplotlib")
+    except Exception as e:
+        print(f"Warning: Phase 2 visualization failed: {e}")
+
     # --- PHASE 4: Model Comparison (BCS302 Metrics) ---
     print("\n--- PHASE 4: Model Comparison (BCS302 Metrics) ---")
 
@@ -109,3 +127,5 @@ if __name__ == "__main__":
 
     print(f"\n--- SUCCESS: Core System Functional ---")
     print(f"If J3 is congested by the AI prediction, the path avoids the J3->J4 segment if possible.")
+
+
