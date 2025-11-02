@@ -33,6 +33,16 @@ def get_color(factor):
 
 st.set_page_config(layout="wide", page_title="PTDS: Gottigere Traffic Predictor")
 
+# --- Session state defaults for validation ---
+if 'start_valid' not in st.session_state:
+    st.session_state['start_valid'] = False
+if 'end_valid' not in st.session_state:
+    st.session_state['end_valid'] = False
+if 'start_coords' not in st.session_state:
+    st.session_state['start_coords'] = None
+if 'end_coords' not in st.session_state:
+    st.session_state['end_coords'] = None
+
 # --- 1. Geographical and Data Setup (BCS304 / AIML Integration) ---
 
 # Define the central area (Bannerghatta Road near the target corridor)
@@ -101,6 +111,44 @@ def geocode_location(place_name: str):
     except Exception:
         return None
 
+
+def validate_location(place_name: str, G=None, center_point: tuple = None):
+    """Validate a human-readable location:
+
+    - Geocodes the place name.
+    - Optionally computes distance to center_point and checks against GRAPH_RADIUS.
+    - Optionally finds nearest node in G (if provided).
+
+    Returns a dict: {success: bool, coords: (lat,lon)|None, message: str, within: bool|None, node: id|None}
+    """
+    coords = geocode_location(place_name)
+    if coords is None:
+        return {'success': False, 'coords': None, 'message': f"Could not geocode '{place_name}'", 'within': None, 'node': None}
+
+    lat, lon = coords
+    msg = f"Geocoded to ({lat:.6f}, {lon:.6f})"
+    within = None
+
+    if center_point is not None:
+        try:
+            dist = euclidean_dist(center_point[0], center_point[1], lat, lon)
+            within = dist <= GRAPH_RADIUS
+            msg += f"; Distance from center: {dist:.0f} m " + ("(within area)" if within else "(outside area)")
+        except Exception:
+            # ignore distance failures
+            pass
+
+    nearest_node = None
+    if G is not None:
+        try:
+            nearest_node = ox.nearest_nodes(G, lon, lat)
+            msg += f"; Nearest node id: {nearest_node}"
+        except Exception:
+            # nearest node failed; ignore
+            nearest_node = None
+
+    return {'success': True, 'coords': coords, 'message': msg, 'within': within, 'node': nearest_node}
+
 # Update visualize_and_optimize signature to accept route_type
 def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_type: str = "AI-Optimized", start_label: str = None, end_label: str = None):
     """
@@ -163,6 +211,10 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
 
     # Create base map after computing route so it's centered correctly
     m = folium.Map(location=center_loc, zoom_start=14, tiles="cartodbpositron")
+    
+    # Add distance scale and fullscreen control
+    folium.plugins.Fullscreen().add_to(m)
+    folium.plugins.MeasureControl(position='bottomleft', primary_length_unit='kilometers').add_to(m)
 
     # Start / End markers (use provided labels if available)
     try:
@@ -198,8 +250,12 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
  
     if optimized_route:
         route_coords = [(G.nodes[node]['y'], G.nodes[node]['x']) for node in optimized_route]
+
+        # Draw a simple blue route line now; detailed popup and km-markers
+        # will be added after metrics are computed to avoid referencing
+        # variables that are initialized later (ai_distance, segment_details, etc.).
         folium.PolyLine(route_coords, color='blue', weight=5, opacity=1.0,
-                        tooltip=f"{route_type} Route: {optimized_cost:.2f} m").add_to(m)
+                        tooltip=f"{route_type} Route").add_to(m)
 
     # Legend (dynamic route label)
     legend_html = f"""
@@ -218,14 +274,306 @@ def visualize_and_optimize(G, dynamic_weights, start_coords, end_coords, route_t
     """
     m.get_root().html.add_child(Element(legend_html))
 
-    # Optionally show comparison metrics (Shortest vs AI)
+    # Calculate detailed route metrics and travel time
     try:
-        shortest_cost = nx.shortest_path_length(G, start_node, end_node, weight='length')
-        ai_cost = nx.shortest_path_length(G, start_node, end_node, weight='dynamic_weight')
-        st.metric("Shortest Path Cost (length)", f"{shortest_cost:.2f} m")
-        st.metric("AI-Optimized Cost (dynamic)", f"{ai_cost:.2f} m")
-    except Exception:
-        pass
+        # Get actual route distances
+        shortest_distance = nx.shortest_path_length(G, start_node, end_node, weight='length')
+        ai_distance = sum(G.edges[u, v, 0]['length'] for u, v in zip(optimized_route[:-1], optimized_route[1:]))
+        aerial_distance = euclidean_dist(start_coords[0], start_coords[1], end_coords[0], end_coords[1])
+
+        # Calculate segment-wise details
+        segment_details = []
+        total_time_mins = 0
+        road_type_distances = {}
+        cumulative_distance = 0
+        
+        for i in range(len(optimized_route)-1):
+            u, v = optimized_route[i], optimized_route[i+1]
+            edge_data = G.edges[u, v, 0]
+            distance = edge_data['length']
+            road_type = edge_data.get('highway', 'unknown')
+            congestion = edge_data.get('congestion_factor', 0.0)
+            
+            # Estimate speed based on road type and congestion
+            base_speed = {
+                'motorway': 80, 'trunk': 60, 'primary': 50,
+                'secondary': 40, 'tertiary': 30, 'residential': 25
+            }.get(road_type, 35)  # km/h
+            
+            # Adjust speed based on congestion
+            if congestion >= 0.8:
+                speed = base_speed * 0.3  # Severe congestion
+            elif congestion >= 0.6:
+                speed = base_speed * 0.5  # Heavy congestion
+            elif congestion >= 0.4:
+                speed = base_speed * 0.7  # Moderate congestion
+            else:
+                speed = base_speed * 0.9  # Light/no congestion
+            
+            # Calculate time for segment
+            time_hours = (distance / 1000) / speed
+            time_mins = time_hours * 60
+            total_time_mins += time_mins
+            
+            # Track distance by road type
+            road_type_distances[road_type] = road_type_distances.get(road_type, 0) + distance
+            
+            cumulative_distance += distance
+            segment_details.append({
+                'distance': distance,
+                'road_type': road_type,
+                'congestion': congestion,
+                'time_mins': time_mins,
+                'cumulative_distance': cumulative_distance
+            })
+        
+        # After computing segments, add detailed route popup and km markers to the map
+        try:
+            # Build HTML summary for the route popup
+            route_html = f"""
+            <div style='font-size:12px;width:220px'>
+              <h4>Route Summary</h4>
+              <b>Total Distance:</b> {ai_distance/1000:.2f} km<br>
+              <b>Est. Time:</b> {int(total_time_mins//60)}h {int(total_time_mins%60)}m<br>
+              <b>Avg Speed:</b> {(ai_distance/1000)/(total_time_mins/60):.1f} km/h<br>
+              <b>Route Type:</b> {route_type}<br>
+              <hr>
+              <b>Traffic Conditions:</b><br>
+              🔴 Heavy: {sum(1 for s in segment_details if s['congestion'] >= 0.6)}<br>
+              🟡 Medium: {sum(1 for s in segment_details if 0.3 <= s['congestion'] < 0.6)}<br>
+              🟢 Low: {sum(1 for s in segment_details if s['congestion'] < 0.3)}
+            </div>
+            """
+
+            # Attach popup to the blue route (add a new polyline with popup)
+            folium.PolyLine(
+                route_coords,
+                color='blue',
+                weight=5,
+                opacity=1.0,
+                popup=folium.Popup(route_html, max_width=300),
+                tooltip=f"Click for route details"
+            ).add_to(m)
+
+            # Add kilometer markers along the route using cumulative_distance
+            total_km = int(ai_distance // 1000)
+            if total_km >= 1:
+                for km_mark in range(1, total_km + 1):
+                    # find the first segment where cumulative_distance >= km_mark*1000
+                    marker_latlon = None
+                    for seg in segment_details:
+                        if seg['cumulative_distance'] >= km_mark * 1000:
+                            # approximate marker position using proportional index on route_coords
+                            frac = seg['cumulative_distance'] / ai_distance if ai_distance > 0 else 0
+                            idx = min(int(len(route_coords) * frac), len(route_coords) - 1)
+                            marker_latlon = route_coords[idx]
+                            break
+                    if marker_latlon:
+                        folium.CircleMarker(
+                            location=marker_latlon,
+                            radius=4,
+                            color="black",
+                            fill=True,
+                            fill_color="white",
+                            popup=f"{km_mark} km",
+                            tooltip=f"{km_mark} km",
+                        ).add_to(m)
+        except Exception:
+            # If adding popup/markers fails, ignore and continue
+            pass
+        
+        # Show primary metrics in columns
+        dist_col1, dist_col2, dist_col3 = st.columns(3)
+        with dist_col1:
+            st.metric("Total Distance", f"{ai_distance/1000:.2f} km", 
+                     delta=f"{((ai_distance-shortest_distance)/shortest_distance)*100:.1f}% vs shortest",
+                     help="Actual distance along the selected route")
+        with dist_col2:
+            st.metric("Estimated Travel Time", 
+                     f"{int(total_time_mins//60)}h {int(total_time_mins%60)}min",
+                     help="Based on road types and current congestion")
+        with dist_col3:
+            avg_speed = (ai_distance/1000)/(total_time_mins/60)
+            st.metric("Average Speed", f"{avg_speed:.1f} km/h",
+                     help="Average travel speed considering traffic")
+        
+        # Show detailed breakdown with tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["Route Analysis", "Speed Profile", "Alternative Routes", "Time Estimates"])
+        
+        with tab1:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write("**Distance by Road Type:**")
+                for road_type, distance in road_type_distances.items():
+                    st.write(f"- {road_type.title()}: {distance/1000:.2f} km ({(distance/ai_distance)*100:.1f}%)")
+            
+            with col2:
+                st.write("**Journey Analysis:**")
+                st.write(f"- Direct (aerial) distance: {aerial_distance/1000:.2f} km")
+                st.write(f"- Route efficiency: {(aerial_distance/ai_distance)*100:.1f}%")
+                st.write(f"- Number of segments: {len(segment_details)}")
+                
+                # Calculate congestion distribution
+                high_cong = sum(1 for s in segment_details if s['congestion'] >= 0.6)
+                med_cong = sum(1 for s in segment_details if 0.3 <= s['congestion'] < 0.6)
+                low_cong = sum(1 for s in segment_details if s['congestion'] < 0.3)
+                st.write(f"- High congestion segments: {high_cong}")
+                st.write(f"- Medium congestion segments: {med_cong}")
+                st.write(f"- Low congestion segments: {low_cong}")
+        
+        with tab2:
+            # Create speed and congestion profile charts
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            
+            # Prepare data for the profile charts
+            distances = [0]
+            speeds = []
+            congestions = []
+            cum_dist = 0
+            
+            for seg in segment_details:
+                cum_dist += seg['distance']
+                distances.append(cum_dist/1000)  # Convert to km
+                
+                # Calculate speed for this segment
+                base_speed = {
+                    'motorway': 80, 'trunk': 60, 'primary': 50,
+                    'secondary': 40, 'tertiary': 30, 'residential': 25
+                }.get(seg['road_type'], 35)
+                
+                # Apply congestion factor
+                if seg['congestion'] >= 0.8:
+                    speed = base_speed * 0.3
+                elif seg['congestion'] >= 0.6:
+                    speed = base_speed * 0.5
+                elif seg['congestion'] >= 0.4:
+                    speed = base_speed * 0.7
+                else:
+                    speed = base_speed * 0.9
+                    
+                speeds.append(speed)
+                congestions.append(seg['congestion'])
+            
+            # Create subplot figure
+            fig = make_subplots(rows=2, cols=1, subplot_titles=('Speed Profile', 'Congestion Level'))
+            
+            # Add speed profile
+            fig.add_trace(
+                go.Scatter(x=distances, y=speeds, mode='lines', name='Speed (km/h)',
+                          line=dict(color='blue')),
+                row=1, col=1
+            )
+            
+            # Add congestion profile
+            fig.add_trace(
+                go.Scatter(x=distances, y=congestions, mode='lines', name='Congestion',
+                          line=dict(color='red')),
+                row=2, col=1
+            )
+            
+            fig.update_layout(height=500, title_text="Route Profiles")
+            fig.update_xaxes(title_text="Distance (km)")
+            fig.update_yaxes(title_text="Speed (km/h)", row=1, col=1)
+            fig.update_yaxes(title_text="Congestion Factor", row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with tab3:
+            # Calculate and show alternative routes
+            st.write("**Alternative Routes Comparison:**")
+            
+            # Get three different routes: shortest, fastest, and balanced
+            routes = {
+                "Current Route": optimized_route,
+                "Shortest Distance": nx.shortest_path(G, start_node, end_node, weight='length'),
+                "Least Congestion": nx.shortest_path(G, start_node, end_node, 
+                                                   weight=lambda u, v, d: d[0].get('length', 1) * (1 + d[0].get('congestion_factor', 0)))
+            }
+            
+            route_metrics = []
+            for route_name, route in routes.items():
+                distance = sum(G.edges[u, v, 0]['length'] for u, v in zip(route[:-1], route[1:]))
+                congestion = np.mean([G.edges[u, v, 0].get('congestion_factor', 0) for u, v in zip(route[:-1], route[1:])])
+                time = sum((G.edges[u, v, 0]['length']/1000) / 
+                         (40 * (1 - 0.7*G.edges[u, v, 0].get('congestion_factor', 0))) 
+                         for u, v in zip(route[:-1], route[1:]))
+                
+                route_metrics.append({
+                    "Route": route_name,
+                    "Distance (km)": f"{distance/1000:.2f}",
+                    "Avg Congestion": f"{congestion:.2f}",
+                    "Est. Time": f"{int(time*60//60)}h {int(time*60%60)}m"
+                })
+            
+            import pandas as pd
+            st.table(pd.DataFrame(route_metrics))
+        
+        with tab4:
+            # Show time estimates for different hours
+            st.write("**Estimated Travel Times by Hour:**")
+            
+            hours = list(range(24))
+            times = []
+            
+            for hour in hours:
+                # Adjust congestion based on time of day
+                if 8 <= hour <= 10 or 17 <= hour <= 19:  # Peak hours
+                    factor = 1.5
+                elif 0 <= hour <= 5:  # Night hours
+                    factor = 0.5
+                else:  # Normal hours
+                    factor = 1.0
+                
+                # Calculate estimated time for this hour
+                time = total_time_mins * factor
+                times.append(time)
+            
+            # Create time estimation chart
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=hours,
+                y=times,
+                mode='lines+markers',
+                name='Travel Time',
+                hovertemplate='Hour: %{x}:00<br>Time: %{text}<extra></extra>',
+                text=[f"{int(t//60)}h {int(t%60)}m" for t in times]
+            ))
+            
+            fig.update_layout(
+                title="Travel Time by Hour of Day",
+                xaxis_title="Hour",
+                yaxis_title="Minutes",
+                hovermode='x'
+            )
+            fig.update_xaxes(ticktext=[f"{h:02d}:00" for h in hours], tickvals=hours)
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+        
+        # Add a distance scale to the map
+        folium.Scale().add_to(m)
+        
+        # Add route distance popup to the blue route line
+        if optimized_route:
+            route_popup = f"""
+            <div style='font-size:12px'>
+            <b>Route Details:</b><br>
+            Distance: {ai_distance/1000:.2f} km<br>
+            Type: {route_type}<br>
+            </div>
+            """
+            folium.PolyLine(
+                route_coords,
+                color='blue',
+                weight=5,
+                opacity=1.0,
+                popup=route_popup,
+                tooltip=f"{route_type} Route: {ai_distance/1000:.2f} km"
+            ).add_to(m)
+            
+    except Exception as e:
+        st.warning(f"Could not calculate some distance metrics: {str(e)}")
 
     return m
 
@@ -239,17 +587,113 @@ st.header("Predicted Traffic Density Map")
 
 # UI: Add inputs for custom route selection (place this in main section before button)
 st.subheader("Custom Route Selection")
-start_location = st.text_input("Enter Start Location", "Gottigere, Kalena Agrahara")
-end_location = st.text_input("Enter End Location", "AMC Engineering College")
+
+# Predefined locations along Bannerghatta Road corridor
+start_locations = [
+    "Gottigere, Kalena Agrahara",
+    "Jayadeva Hospital, Bannerghatta Road",
+    "Jambu Savari Dinne, Bannerghatta Road",
+    "IIM Bangalore",
+    "Bilekahalli, Bannerghatta Road",
+    "Hulimavu Gate",
+    "Meenakshi Temple, Bannerghatta Road",
+    "Bannerghatta Circle",
+    "Royal Meenakshi Mall",
+    "Dairy Circle, Bannerghatta Road",
+    "BTM Layout 2nd Stage",
+    "JP Nagar 6th Phase",
+    "Arekere Gate",
+    "DeviKrupa Temple",
+    "Apollo Hospital Bannerghatta",
+    "Nice Road Junction",
+    "Hulimavu Police Station",
+    "DLF Apartments"
+]
+
+# Educational institutions and landmarks for end points
+end_locations = [
+    "AMC Engineering College",
+    "Reva University",
+    "Christ University Bannerghatta Road Campus",
+    "New Horizon College of Engineering",
+    "IIMB Management Institute",
+    "Alliance University",
+    "BMS College of Engineering",
+    "Oxford College of Engineering",
+    "Dayananda Sagar College",
+    "Sir M Visvesvaraya Institute of Technology"
+]
+
+# Custom location input with dropdown and text input for start location
+col_start1, col_start2 = st.columns([1, 1])
+with col_start1:
+    start_location = st.selectbox("Choose Start Location", start_locations, index=0)
+with col_start2:
+    start_location = st.text_input("Or Enter Custom Start Location", value="", help="Type a custom location if not in the dropdown list")
+    if not start_location:  # If text input is empty, use dropdown value
+        start_location = start_locations[0]
+
+# Custom location input with dropdown and text input for end location
+col_end1, col_end2 = st.columns([1, 1])
+with col_end1:
+    end_location = st.selectbox("Choose Destination", end_locations, index=0)
+with col_end2:
+    end_location = st.text_input("Or Enter Custom Destination", value="", help="Type a custom destination if not in the dropdown list")
+    if not end_location:  # If text input is empty, use dropdown value
+        end_location = end_locations[0]
 
 # add time-of-day selector and routing strategy selector before the button
 selected_hour = st.slider("Select Hour of Day", 0, 23, 8)
 route_type = st.radio("Choose Routing Strategy", ["AI-Optimized", "Shortest Path"])
 
+# --- Validation UI ---
+st.markdown("### Validate Locations")
+col_validate1, col_validate2, col_validate3 = st.columns([1,1,2])
+with col_validate1:
+    if st.button("Validate Start Location"):
+        res = validate_location(start_location, None, CENTER_POINT)
+        if res['success']:
+            st.success(res['message'])
+            st.session_state['start_valid'] = True
+            st.session_state['start_coords'] = res['coords']
+        else:
+            st.error(res['message'])
+            st.session_state['start_valid'] = False
+with col_validate2:
+    if st.button("Validate End Location"):
+        res = validate_location(end_location, None, CENTER_POINT)
+        if res['success']:
+            st.success(res['message'])
+            st.session_state['end_valid'] = True
+            st.session_state['end_coords'] = res['coords']
+        else:
+            st.error(res['message'])
+            st.session_state['end_valid'] = False
+with col_validate3:
+    if st.button("Validate Both"):
+        res_start = validate_location(start_location, None, CENTER_POINT)
+        res_end = validate_location(end_location, None, CENTER_POINT)
+        if res_start['success'] and res_end['success']:
+            st.success("Both locations validated")
+            st.write("Start:", res_start['message'])
+            st.write("End:", res_end['message'])
+            st.session_state['start_valid'] = True
+            st.session_state['end_valid'] = True
+            st.session_state['start_coords'] = res_start['coords']
+            st.session_state['end_coords'] = res_end['coords']
+        else:
+            if not res_start['success']:
+                st.error("Start: " + res_start['message'])
+                st.session_state['start_valid'] = False
+            if not res_end['success']:
+                st.error("End: " + res_end['message'])
+                st.session_state['end_valid'] = False
+
 # Replace button handler: geocode -> compute midpoint -> load graph -> simulate -> visualize
 if st.button("Calculate Optimal Route & Density Map", type="primary"):
-    start_coords = geocode_location(start_location)
-    end_coords = geocode_location(end_location)
+    # Prefer validated coordinates stored in session_state (if user validated previously)
+    start_coords = st.session_state.get('start_coords') or geocode_location(start_location)
+    end_coords = st.session_state.get('end_coords') or geocode_location(end_location)
     if start_coords is None:
         st.error(f"Could not geocode start location: {start_location}")
     elif end_coords is None:
@@ -320,5 +764,33 @@ if st.button("Calculate Optimal Route & Density Map", type="primary"):
             ax.set_xlabel("Congestion Factor")
             ax.set_ylabel("Edge Count")
             st.pyplot(fig)
+            
+            # Add nearby landmarks
+            landmarks = {
+                "Hospitals": ["Jayadeva Hospital", "Apollo Hospital", "Fortis Hospital"],
+                "Shopping": ["Royal Meenakshi Mall", "Gopalan Mall", "Bannerghatta Mall"],
+                "Education": ["IIM Bangalore", "Christ University", "AMC College"],
+                "Transport": ["Metro Station", "Bus Terminal", "Nice Road Junction"]
+            }
+            
+            st.subheader("Nearby Landmarks")
+            landmark_cols = st.columns(len(landmarks))
+            
+            for col, (category, places) in zip(landmark_cols, landmarks.items()):
+                with col:
+                    st.write(f"**{category}**")
+                    for place in places:
+                        # Get the coordinates for the landmark (if available)
+                        try:
+                            coords = geocode_location(f"{place}, Bannerghatta Road, Bangalore")
+                            if coords:
+                                dist = euclidean_dist(start_coords[0], start_coords[1], coords[0], coords[1])
+                                st.write(f"- {place} ({dist/1000:.1f} km)")
+                                
+                                # Indicate if landmark is within the displayed map area
+                                if dist <= GRAPH_RADIUS * 1.5:  # 1.5x the graph radius
+                                    st.write("  — within map area")
+                        except Exception:
+                            st.write(f"- {place} (distance unknown)")
         except Exception:
             pass
