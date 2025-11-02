@@ -57,9 +57,10 @@ END_NODE_NAME = "AMC Engineering College"
 
 @st.cache_data
 def load_and_analyze_graph(center_point, dist=GRAPH_RADIUS):
-    """Loads the road network around given center using OSMnx. Cached per center/dist."""
+    """Loads and projects the road network around given center using OSMnx. Cached per center/dist."""
     with st.spinner("Loading geographical data..."):
         G = ox.graph_from_point(center_point, dist=dist, network_type="drive")
+        G = ox.project_graph(G)  # Project to metric coordinates
         return G
 
 # --- 2. Simulation: AI Prediction Result (Dynamic Weights) ---
